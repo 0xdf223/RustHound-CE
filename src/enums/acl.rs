@@ -10,7 +10,7 @@ use crate::enums::constants::*;
 use crate::enums::secdesc::*;
 use crate::enums::sid::sid_maker;
 use bitflags::bitflags;
-use log::{error, trace, warn};
+use log::{debug, error, trace, warn};
 
 /// Node-level OWNER RIGHTS summary: `(doesanyacegrantownerrights,
 /// doesanyinheritedacegrantownerrights)`. Per-ACE flags are set by
@@ -451,7 +451,26 @@ fn ace_maker<T: LdapObject>(
                         "".to_string(),
                     ));
                 }
-            } 
+                // WriteProperty on the managedBy attribute (schemaIDGUID
+                // 0296c120-40da-11d1-a9c0-0000f80367c1). On an RODC computer object,
+                // managedBy names the RODC's delegated administrator, who gets local
+                // admin on the RODC, so writing it is a privilege escalation. On other
+                // objects it only matters to tooling that trusts managedBy. BloodHound
+                // has no such edge kind, so it is also emitted in the OpenGraph file.
+                if ((entry_type == "Computer") || (entry_type == "Group") || (entry_type == "OU"))
+                    && (&flags & ACE_OBJECT_TYPE_PRESENT == ACE_OBJECT_TYPE_PRESENT)
+                    && (&ace_guid == guid_map.get("managed-by").unwrap_or(&String::from("GUID-NOT-FOUND")))
+                {
+                    debug!("WriteManagedBy ACE: {} has WriteProperty on managedBy of {}", sid, object.get_object_identifier());
+                    relations.push(AceTemplate::new(
+                        sid.to_owned(),
+                        "".to_string(),
+                        "WriteManagedBy".to_string(),
+                        is_inherited,
+                        "".to_string(),
+                    ));
+                }
+            }
             else if (MaskFlags::ADS_RIGHT_DS_SELF.bits() | mask) == mask 
             {
                 if (entry_type == "Group") && (&ace_guid == WRITE_MEMBER)
@@ -2969,5 +2988,86 @@ mod tests {
             )
             .unwrap();
         assert!(!*computer.get_is_acl_protected());
+    }
+
+    /// Self-relative security descriptor whose DACL holds one
+    /// ACCESS_ALLOWED_OBJECT ACE granting WriteProperty, scoped to
+    /// `object_type` (a GUID in on-disk mixed-endian byte order), to
+    /// S-1-5-21-1-2-3-1105.
+    fn sd_with_write_property_ace(object_type: [u8; 16]) -> Vec<u8> {
+        let mut sid = vec![1, 5, 0, 0, 0, 0, 0, 5];
+        for sub in [21u32, 1, 2, 3, 1105] {
+            sid.extend_from_slice(&sub.to_le_bytes());
+        }
+        let mut ace = vec![0x05, 0x00]; // ACCESS_ALLOWED_OBJECT_ACE_TYPE, no flags
+        let ace_size = (4 + 4 + 4 + 16 + sid.len()) as u16;
+        ace.extend_from_slice(&ace_size.to_le_bytes());
+        ace.extend_from_slice(&0x20u32.to_le_bytes()); // ADS_RIGHT_DS_WRITE_PROP
+        ace.extend_from_slice(&1u32.to_le_bytes()); // ACE_OBJECT_TYPE_PRESENT
+        ace.extend_from_slice(&object_type);
+        ace.extend_from_slice(&sid);
+
+        let mut acl = vec![4, 0];
+        acl.extend_from_slice(&((8 + ace.len()) as u16).to_le_bytes());
+        acl.extend_from_slice(&1u16.to_le_bytes());
+        acl.extend_from_slice(&0u16.to_le_bytes());
+        acl.extend_from_slice(&ace);
+
+        let control = SecurityDescriptorFlags::SELF_RELATIVE | SecurityDescriptorFlags::DACL_PRESENT;
+        let mut sd = vec![1, 0];
+        sd.extend_from_slice(&control.bits().to_le_bytes());
+        sd.extend_from_slice(&0u32.to_le_bytes()); // owner
+        sd.extend_from_slice(&0u32.to_le_bytes()); // group
+        sd.extend_from_slice(&0u32.to_le_bytes()); // sacl
+        sd.extend_from_slice(&20u32.to_le_bytes()); // dacl right after header
+        sd.extend_from_slice(&acl);
+        sd
+    }
+
+    /// managed-by schemaIDGUID 0296c120-40da-11d1-a9c0-0000f80367c1.
+    const MANAGED_BY_GUID_BYTES: [u8; 16] = [
+        0x20, 0xc1, 0x96, 0x02, 0xda, 0x40, 0xd1, 0x11,
+        0xa9, 0xc0, 0x00, 0x00, 0xf8, 0x03, 0x67, 0xc1,
+    ];
+
+    fn write_property_rights<T: LdapObject>(object: &mut T, entry_type: &str, object_type: [u8; 16]) -> Vec<String> {
+        parse_ntsecuritydescriptor(
+            object,
+            &sd_with_write_property_ace(object_type),
+            entry_type,
+            &HashMap::new(),
+            &HashMap::new(),
+            "EXAMPLE.LOCAL",
+            &HashMap::new(),
+        )
+        .iter()
+        .filter(|ace| ace.principal_sid().ends_with("-1105"))
+        .map(|ace| ace.right_name().to_owned())
+        .collect()
+    }
+
+    #[test]
+    fn write_property_on_managed_by_emits_write_managed_by() {
+        let rights = write_property_rights(&mut crate::objects::computer::Computer::new(), "Computer", MANAGED_BY_GUID_BYTES);
+        assert_eq!(rights, vec!["WriteManagedBy".to_string()]);
+
+        let rights = write_property_rights(&mut crate::objects::group::Group::new(), "Group", MANAGED_BY_GUID_BYTES);
+        assert_eq!(rights, vec!["WriteManagedBy".to_string()]);
+
+        let rights = write_property_rights(&mut crate::objects::ou::Ou::new(), "OU", MANAGED_BY_GUID_BYTES);
+        assert_eq!(rights, vec!["WriteManagedBy".to_string()]);
+    }
+
+    #[test]
+    fn write_property_on_other_attribute_does_not_emit_write_managed_by() {
+        // managed-objects (0296c124-...), one byte off from managed-by.
+        let mut other = MANAGED_BY_GUID_BYTES;
+        other[0] = 0x24;
+        let rights = write_property_rights(&mut crate::objects::computer::Computer::new(), "Computer", other);
+        assert!(!rights.contains(&"WriteManagedBy".to_string()), "{rights:?}");
+
+        // Users have no managedBy attribute.
+        let rights = write_property_rights(&mut User::new(), "User", MANAGED_BY_GUID_BYTES);
+        assert!(!rights.contains(&"WriteManagedBy".to_string()), "{rights:?}");
     }
 }
